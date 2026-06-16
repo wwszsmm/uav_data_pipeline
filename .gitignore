@@ -1,0 +1,56 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+config.py
+
+# Virtual environments
+.venv/
+venv/
+env/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+
+# Logs
+*.log
+
+# Data files
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.mp4
+*.avi
+*.mov
+*.json
+*.csv
+*.xlsx
+
+# YOLO / ML outputs
+runs/
+weights/
+*.pt
+*.onnx
+*.engine
+
+# Feature cache
+*.npz
+features/
+feature_cache/
+
+# Project output folders
+output/
+outputs/
+clean/
+images/
+labels/
+crops/
+predict_result/
+train_result/
+dataset/
+copied_video/
