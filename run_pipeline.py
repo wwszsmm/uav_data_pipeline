@@ -21,6 +21,8 @@ SCRIPTS = [
     ("视频抽帧", "vedio_cut_v2.py"),
     ("汇总图片", "pic_gather_v2.py"),
     ("相似图片去重", "SimilarPic_v2.py"),
+    ("检查图片质量", "check_images.py"),
+    ("生成统计报告", "generate_report.py"),
 ]
 
 
