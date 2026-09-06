@@ -93,10 +93,10 @@ python run_pipeline.py
 也可以单独运行每个模块：
 
 ```powershell
-python vedioCopy_v2.py
-python vedio_cut_v2.py
-python pic_gather_v2.py
-python SimilarPic_v2.py
+python video_copy.py
+python frame_extraction.py
+python image_gather.py
+python image_deduplication.py
 python check_images.py
 python generate_report.py
 ```
