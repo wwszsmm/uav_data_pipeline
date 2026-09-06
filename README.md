@@ -2,9 +2,9 @@
 
 [中文说明](README_zh.md)
 
-A configurable prototype for processing UAV videos into a cleaned image dataset and evaluating a road segmentation model.
+A configurable UAV data preprocessing pipeline for converting raw videos into cleaned, traceable image datasets using multiprocessing, CNN feature extraction, and FAISS similarity search.
 
-The project was developed from an internship workflow. The public repository contains code, evaluation summaries, and non-sensitive result figures only. Internal UAV data and model weights are not included.
+The project was developed from an internship workflow. The public repository contains code, evaluation summaries, and non-sensitive result figures only. Internal UAV data and model weights are not included. The repository also includes sanitized evaluation artifacts from a downstream YOLO-based road segmentation experiment.
 
 ## Pipeline
 
@@ -58,6 +58,39 @@ Pipeline Summary Report
     ├── MaskPR_curve.png
     └── confusion_matrix_normalized.png
 ```
+
+## Installation
+
+Python 3.10 or later is recommended.
+
+1. Clone the repository:
+
+```bash
+git clone https://github.com/wwszsmm/uav_data_pipeline.git
+cd uav_data_pipeline
+```
+
+2. Install the required dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+3. Create a local configuration file from the example:
+
+```bash
+cp config.example.py config.py
+```
+
+Update the paths and parameters in `config.py` according to your local environment.
+
+4. Run the full pipeline:
+
+```bash
+python run_pipeline.py
+```
+
+Individual modules can also be run separately if needed.
 
 ## Configuration
 
