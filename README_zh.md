@@ -42,10 +42,10 @@
 ```text
 .
 ├── run_pipeline.py
-├── vedioCopy_v2.py
-├── vedio_cut_v2.py
-├── pic_gather_v2.py
-├── SimilarPic_v2.py
+├── video_copy.py
+├── frame_extraction.py
+├── image_gather.py
+├── image_deduplication.py
 ├── check_images.py
 ├── generate_report.py
 ├── config.example.py
