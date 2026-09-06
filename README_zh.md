@@ -59,6 +59,39 @@
     └── confusion_matrix_normalized.png
 ```
 
+## 安装
+
+建议使用 Python 3.10 或更高版本。
+
+1. 克隆仓库：
+
+```bash
+git clone https://github.com/wwszsmm/uav_data_pipeline.git
+cd uav_data_pipeline
+```
+
+2. 安装项目依赖：
+
+```bash
+pip install -r requirements.txt
+```
+
+3. 根据示例创建本地配置文件：
+
+```bash
+cp config.example.py config.py
+```
+
+根据本地环境修改 `config.py` 中的数据路径和相关参数。
+
+4. 运行完整数据处理流水线：
+
+```bash
+python run_pipeline.py
+```
+
+如有需要，也可以单独运行各个处理模块。
+
 ## 配置
 
 复制配置示例：
