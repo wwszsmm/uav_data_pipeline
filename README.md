@@ -42,10 +42,10 @@ Pipeline Summary Report
 ```text
 .
 ├── run_pipeline.py
-├── vedioCopy_v2.py
-├── vedio_cut_v2.py
-├── pic_gather_v2.py
-├── SimilarPic_v2.py
+├── video_copy.py
+├── frame_extraction.py
+├── image_gather.py
+├── image_deduplication.py
 ├── check_images.py
 ├── generate_report.py
 ├── config.example.py
@@ -93,10 +93,10 @@ The pipeline runs the configured stages in sequence and stops if one stage fails
 Individual modules can also be run separately:
 
 ```powershell
-python vedioCopy_v2.py
-python vedio_cut_v2.py
-python pic_gather_v2.py
-python SimilarPic_v2.py
+python video_copy.py
+python frame_extraction.py
+python image_gather.py
+python image_deduplication.py
 python check_images.py
 python generate_report.py
 ```
