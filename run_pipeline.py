@@ -17,12 +17,12 @@ from config import (
 BASE_DIR = Path(__file__).parent
 
 SCRIPTS = [
-    ("复制视频", "vedioCopy_v2.py"),
-    ("视频抽帧", "vedio_cut_v2.py"),
-    ("汇总图片", "pic_gather_v2.py"),
-    ("相似图片去重", "SimilarPic_v2.py"),
-    ("检查图片质量", "check_images.py"),
-    ("生成统计报告", "generate_report.py"),
+    ("复制视频", "video_copy.py"),
+    ("视频抽帧", "frame_extraction.py"),
+    ("汇总图片", "image_gather.py"),
+    ("相似图片去重", "image_deduplication.py"),
+    ("检查图片", "check_images.py"),
+    ("生成报告", "generate_report.py"),
 ]
 
 
