@@ -1,6 +1,7 @@
 from pathlib import Path
 
 # Input directory containing the original UAV videos.
+# Relative paths are resolved against this configuration file, not the shell cwd.
 INPUT_PATH = Path(r"replace_with_your_video_directory")
 
 # All generated outputs are stored next to the input directory.
@@ -18,7 +19,8 @@ MIN_SIMILARITY_THRESHOLD = 0.90
 BATCH_SIZE = 32
 MAX_THREADS = 12
 
-# OpenCV CUDA video decoding is optional.
+# Video decoding only. CNN uses CUDA automatically when the installed torch supports it.
+# Standard opencv-python normally falls back to CPU; custom CUDA OpenCV is optional.
 USE_GPU = False
 
 VIDEO_SOURCE_DIR = INPUT_PATH

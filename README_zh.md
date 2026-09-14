@@ -49,6 +49,11 @@
 ├── check_images.py
 ├── generate_report.py
 ├── config.example.py
+├── pipeline_config.py
+├── pipeline_utils.py
+├── requirements.txt
+├── constraints-windows-py312.txt
+├── tests/
 └── model_result/
     ├── English_evaluation.md
     ├── Chinese_evaluation.md
@@ -61,7 +66,7 @@
 
 ## 安装
 
-建议使用 Python 3.10 或更高版本。
+已验证的基准环境为 **Windows x64、Python 3.12、CPU 版 PyTorch**。其他操作系统、Python 和 CUDA 组合尚未验证。请先创建并激活虚拟环境，再安装依赖。
 
 1. 克隆仓库：
 
@@ -73,7 +78,7 @@ cd uav_data_pipeline
 2. 安装项目依赖：
 
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt -c constraints-windows-py312.txt
 ```
 
 3. 根据示例创建本地配置文件：
@@ -134,6 +139,39 @@ python check_images.py
 python generate_report.py
 ```
 
+## 运行与恢复规则
+
+- 配置中的相对路径以配置文件所在目录为基准。默认读取 `config.py`；也可将环境变量 `UAV_CONFIG` 设置为另一个配置文件的绝对路径。
+- 输入根目录与输出根目录必须相互独立，不能嵌套；各阶段输出目录必须是 `OUTPUT_ROOT` 内不重叠的目录。同一输出根目录一次只运行一个流程，运行期间不要修改输入和配置。
+- **旧版迁移：** 请在配置文件中选择新的空 `OUTPUT_ROOT`。旧版非空阶段目录没有归属清单时会被拒绝使用，原数据不会被清理。不要删除清单来强制复用旧目录。
+- 复制采用临时文件加原子替换，并比较 SHA-256。各阶段记录当前有效文件；源内容更新或文件移除会反映到当前输出。只清理本阶段曾记录且未被外部修改的过期文件，不删除无关文件。
+- 抽帧快照关联视频内容、抽帧间隔及解码配置；只有记录中的图片完整时才复用。旧快照保留在磁盘中，但汇总和报告只读取当前清单，因此修改输入或参数后磁盘占用可能增加。
+- 写入失败、空输入以及可检测到的解码不完整会阻止后续处理。OpenCV 不一定提供可靠的总帧数，因此不能保证检测所有损坏视频。
+- 特征缓存记录图片内容摘要、模型标识和软件版本；内容变化或缓存损坏时重建。预处理采用模型自身的变换；相似度阈值仍需用有代表性的无人机图片验证。
+- 无法读取的图片不会进入去重输出，文件名列在 `deduped_images/rejected_images.json`。最终图片完整性检查必须通过。`pipeline_status.json` 与 `pipeline_report.md` 区分失败、完成、排除异常图片后完成；重复率以有效输入图片为分母。
+- 单独运行模块时需要前置阶段生成的有效清单。修改输入后应重跑完整流水线；单独生成报告不能认证一次新运行，配置或数据变化后会标注未验证。
+- `USE_GPU` 仅控制视频解码；标准 `opencv-python` 在 CUDA 解码不可用时回退到 CPU。CNN 是否使用 CUDA 由安装的 PyTorch 独立判断。
+- 首次 CNN 缓存未命中时可能下载约 10 MB 的公开 MobileNet ImageNet 权重。离线运行前可执行 `python -c "from imagededup.methods.cnn import CNN; CNN()"` 准备缓存，保留 PyTorch 缓存目录或通过 `TORCH_HOME` 指定路径。预处理无需私有分割模型权重；六个阶段不使用 `ultralytics`，运行流水线不会重新生成历史分割评估结果。
+
+### 验证方法
+
+在同一虚拟环境中安装测试依赖：
+
+```bash
+python -m pip install -r requirements-dev.txt -c constraints-windows-py312.txt
+python -m pip check
+python -m pytest -q
+```
+
+默认测试不下载模型，并跳过完整模型测试。准备好模型缓存后，可在 PowerShell 中运行真实 CPU 集成测试：
+
+```powershell
+$env:UAV_RUN_MODEL_TEST = "1"
+python -m pytest -q
+```
+
+集成测试临时生成合成视频，检查六个阶段、缓存复用、同名视频替换、输入增删及过期报告识别，不验证私有无人机数据质量、GPU 执行或历史 YOLO 指标。
+
 ## 道路分割模型评估
 
 项目对一个包含四类道路相关目标的 YOLO 分割模型进行了评估。
@@ -168,7 +206,7 @@ python generate_report.py
 - 公开仓库不包含公司内部图片、完整数据集和模型权重。
 - 部分标注不完整，可能影响验证指标的解释。
 - 远距离和小目标区域仍然是当前模型的主要弱点。
-- 当图片集合发生变化时，现有特征缓存需要重新生成。
+- 图片内容或缓存记录的模型环境变化时，特征缓存自动重建。
 
 ## 隐私说明
 
