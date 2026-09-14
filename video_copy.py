@@ -1,11 +1,11 @@
 import os
 import re
-import shutil
 import hashlib
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from config import (
+from pipeline_utils import atomic_copy, digest, finish_manifest, manifest, owned_path, unique_mapping
+from pipeline_config import (
     VIDEO_SOURCE_DIR,
     VIDEO_COPY_DIR,
     VIDEO_EXTS,
@@ -28,9 +28,9 @@ def make_target_name(src_path, src_root):
     relative_path = src_path.relative_to(src_root)
     relative_str = str(relative_path).replace("\\", "/")
 
-    hash_id = hashlib.md5(relative_str.encode("utf-8")).hexdigest()[:8]
+    hash_id = hashlib.sha256(relative_str.encode("utf-8")).hexdigest()
 
-    stem = sanitize_filename(src_path.stem)
+    stem = sanitize_filename(src_path.stem)[:60]
     ext = src_path.suffix.lower()
 
     return f"{stem}_{hash_id}{ext}"
@@ -41,28 +41,19 @@ def copy_file_task(src_path, src_root, dst_dir):
     单个视频复制任务。
 
     逻辑：
-    1. 目标文件不存在：复制
-    2. 目标文件已存在：直接跳过
+    仅跳过内容完全一致的文件；先复制到临时文件，再原子替换。
     """
     src_path = Path(src_path)
     src_root = Path(src_root)
     dst_dir = Path(dst_dir)
 
     target_name = make_target_name(src_path, src_root)
-    dst_path = dst_dir / target_name
-
-    if dst_path.exists():
-        return {
-            "status": "skipped",
-            "source": str(src_path),
-            "target": str(dst_path),
-            "message": "目标文件已存在，跳过"
-        }
+    dst_path = owned_path(dst_dir, target_name)
 
     try:
-        shutil.copy2(src_path, dst_path)
+        status = atomic_copy(src_path, dst_path)
         return {
-            "status": "copied",
+            "status": status,
             "source": str(src_path),
             "target": str(dst_path),
             "message": "复制成功"
@@ -94,22 +85,25 @@ def main():
     src_dir = Path(VIDEO_SOURCE_DIR)
     dst_dir = Path(VIDEO_COPY_DIR)
 
-    dst_dir.mkdir(parents=True, exist_ok=True)
-
     print("正在扫描视频文件...")
     print(f"源文件夹: {src_dir}")
     print(f"目标文件夹: {dst_dir}")
 
     if not src_dir.exists():
-        print(f"源文件夹不存在: {src_dir}")
-        return
+        raise FileNotFoundError(f"源文件夹不存在: {src_dir}")
 
     video_files = find_video_files(src_dir)
     total = len(video_files)
 
     if total == 0:
-        print(f"没有找到视频文件，请检查路径: {src_dir}")
-        return
+        raise RuntimeError(f"没有找到视频文件，请检查路径: {src_dir}")
+
+    targets = unique_mapping((make_target_name(p, src_dir), p) for p in video_files)
+    previous = manifest(dst_dir)
+    for name, source in targets.items():
+        target = owned_path(dst_dir, name)
+        if target.exists() and name not in previous["files"] and digest(target) != digest(source):
+            raise RuntimeError(f"Untracked output conflicts with input: {target}")
 
     print(f"找到 {total} 个视频，开始复制...")
 
@@ -142,6 +136,9 @@ def main():
     print(f"新增复制: {copied}")
     print(f"跳过已存在: {skipped}")
     print(f"失败: {failed}")
+    if failed:
+        raise RuntimeError(f"视频复制失败: {failed}")
+    finish_manifest(dst_dir, {name: digest(dst_dir / name) for name in targets}, previous)
 
 
 if __name__ == "__main__":

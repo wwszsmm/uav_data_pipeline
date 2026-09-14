@@ -1,93 +1,101 @@
 from datetime import datetime
+import hashlib
+import json
 from pathlib import Path
 
-from config import (
-    OUTPUT_ROOT,
-    VIDEO_SOURCE_DIR,
-    VIDEO_COPY_DIR,
-    CUT_IMAGE_DIR,
-    GATHER_IMAGE_DIR,
-    DEDUP_IMAGE_DIR,
-    VIDEO_EXTS,
-    IMAGE_EXTS,
-    FRAME_INTERVAL,
-    MIN_SIMILARITY_THRESHOLD,
-)
+from pipeline_config import (OUTPUT_ROOT, VIDEO_SOURCE_DIR, VIDEO_COPY_DIR, CUT_IMAGE_DIR,
+                             GATHER_IMAGE_DIR, DEDUP_IMAGE_DIR, VIDEO_EXTS, IMAGE_EXTS,
+                             config_path)
+from pipeline_utils import digest, managed_files, read_json, MANIFEST
+
+
+def state_fingerprint():
+    """Bind a successful report to the inputs and active outputs that were checked."""
+    state = {}
+    folders = [(VIDEO_SOURCE_DIR, VIDEO_EXTS), (VIDEO_COPY_DIR, VIDEO_EXTS),
+               (CUT_IMAGE_DIR, IMAGE_EXTS), (GATHER_IMAGE_DIR, IMAGE_EXTS), (DEDUP_IMAGE_DIR, IMAGE_EXTS)]
+    for index, (folder, extensions) in enumerate(folders):
+        paths = (sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in extensions)
+                 if index == 0 else managed_files(folder, extensions))
+        state[str(index)] = {p.relative_to(folder).as_posix(): digest(p) for p in paths}
+    for path in (DEDUP_IMAGE_DIR / "dedup_summary.json", OUTPUT_ROOT / "image_check.json"):
+        state[path.name] = digest(path)
+    return hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest()
 
 
 def count_files(folder, extensions):
     folder = Path(folder)
-
     if not folder.exists():
         return 0
-
-    return sum(
-        1
-        for path in folder.rglob("*")
-        if path.is_file() and path.suffix.lower() in extensions
-    )
-
-
-def count_duplicate_images():
-    csv_path = Path(DEDUP_IMAGE_DIR) / "duplicate_pairs.csv"
-
-    if not csv_path.exists():
-        return 0
-
-    with open(csv_path, "r", encoding="utf-8-sig") as file:
-        return max(sum(1 for _ in file) - 1, 0)
+    record = read_json(folder / MANIFEST)
+    if record is not None:
+        return sum(Path(n).suffix.lower() in extensions for n in record["files"])
+    return sum(p.is_file() and p.suffix.lower() in extensions for p in folder.rglob("*"))
 
 
 def main():
-    original_videos = count_files(VIDEO_SOURCE_DIR, VIDEO_EXTS)
-    copied_videos = count_files(VIDEO_COPY_DIR, VIDEO_EXTS)
-    cut_images = count_files(CUT_IMAGE_DIR, IMAGE_EXTS)
-    gathered_images = count_files(GATHER_IMAGE_DIR, IMAGE_EXTS)
-    deduped_images = count_files(DEDUP_IMAGE_DIR, IMAGE_EXTS)
-    duplicate_images = count_duplicate_images()
-
-    duplicate_rate = (
-        duplicate_images / gathered_images * 100
-        if gathered_images > 0
-        else 0
-    )
-
+    status = read_json(OUTPUT_ROOT / "pipeline_status.json",
+                       {"status": "not_verified", "stages": []})
+    dedup = read_json(DEDUP_IMAGE_DIR / "dedup_summary.json", {})
+    check = read_json(OUTPUT_ROOT / "image_check.json", {})
+    successful = status["status"] in ("complete", "complete_with_exclusions")
+    configuration = status.get("configuration", {})
+    if successful and configuration.get("sha256") != digest(config_path):
+        status["status"] = "configuration_changed_since_run"
+        successful = False
+    if successful:
+        try:
+            successful = status.get("state_sha256") == state_fingerprint()
+        except (OSError, ValueError, RuntimeError):
+            successful = False
+        if not successful:
+            status["status"] = "data_changed_or_unverified"
+    # Failed runs must not label previous-run summaries as current verified results.
+    counts = [
+        ("Original videos", count_files(VIDEO_SOURCE_DIR, VIDEO_EXTS)),
+        ("Current copied videos", count_files(VIDEO_COPY_DIR, VIDEO_EXTS)),
+        ("Current extracted images", count_files(CUT_IMAGE_DIR, IMAGE_EXTS)),
+        ("Current gathered images", count_files(GATHER_IMAGE_DIR, IMAGE_EXTS)),
+        ("Invalid input images excluded", dedup.get("invalid_input", "Not verified") if successful else "Not verified"),
+        ("Duplicate images", dedup.get("duplicates", "Not verified") if successful else "Not verified"),
+        ("Verified valid output images", check.get("valid", "Not verified") if successful else "Not verified"),
+        ("Output integrity failures", check.get("invalid", "Not verified") if successful else "Not verified"),
+        ("Failed stages", sum(s["status"] == "failed" for s in status["stages"])),
+    ]
+    table = "\n".join(f"| {name} | {value} |" for name, value in counts)
+    stages = "\n".join(f"- {s['stage']}: {s['status']}" for s in status["stages"]) or "- No orchestrated run recorded"
+    rate = (f"{dedup['duplicates'] / dedup['valid_input']:.2%}"
+            if successful and dedup.get("valid_input") else "Not verified")
     report = f"""# UAV Data Pipeline Report
 
 Generated: {datetime.now():%Y-%m-%d %H:%M:%S}
+Run started: {status.get('started', 'Not recorded')}
+Run status: **{status['status']}**
 
 ## Configuration
-
-- Frame interval: {FRAME_INTERVAL}
-- Similarity threshold: {MIN_SIMILARITY_THRESHOLD}
+- Recorded frame interval: {configuration.get('frame_interval', 'Not recorded')}
+- Recorded similarity threshold: {configuration.get('similarity_threshold', 'Not recorded')}
 
 ## Results
-
 | Item | Count |
 |---|---:|
-| Original videos | {original_videos} |
-| Copied videos | {copied_videos} |
-| Extracted images | {cut_images} |
-| Gathered images | {gathered_images} |
-| Duplicate images | {duplicate_images} |
-| Deduplicated images | {deduped_images} |
-| Duplicate rate | {duplicate_rate:.2f}% |
+{table}
+
+Duplicate rate among valid input images: {rate}
+
+Counts describe active output manifests. After a failed run, some manifests can
+still describe an earlier stage/run; they are not proof of successful processing.
+Historical frame snapshots are excluded from these counts.
+An independently invoked report checks recorded configuration/content fingerprints;
+it does not rerun video decoding, CNN inference or the image integrity stage.
+
+## Stages
+{stages}
 """
-
-    output_root = Path(OUTPUT_ROOT)
-    output_root.mkdir(parents=True, exist_ok=True)
-
-    report_path = output_root / "pipeline_report.md"
-    report_path.write_text(report, encoding="utf-8")
-
-    print("\n统计报告生成完成")
-    print(f"原始视频: {original_videos}")
-    print(f"抽帧图片: {cut_images}")
-    print(f"汇总图片: {gathered_images}")
-    print(f"重复图片: {duplicate_images}")
-    print(f"去重后图片: {deduped_images}")
-    print(f"重复比例: {duplicate_rate:.2f}%")
-    print(f"报告路径: {report_path}")
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    path = OUTPUT_ROOT / "pipeline_report.md"
+    path.write_text(report, encoding="utf-8")
+    print(f"Report: {path}; status={status['status']}")
 
 
 if __name__ == "__main__":

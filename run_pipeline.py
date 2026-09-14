@@ -4,7 +4,13 @@ import subprocess
 import time
 from pathlib import Path
 
-from config import (
+from pipeline_utils import atomic_json, digest, read_json, MANIFEST
+from pipeline_config import (
+    OUTPUT_ROOT,
+    DEDUP_IMAGE_DIR,
+    config_path,
+    FRAME_INTERVAL,
+    MIN_SIMILARITY_THRESHOLD,
     VIDEO_SOURCE_DIR,
     VIDEO_COPY_DIR,
     CUT_IMAGE_DIR,
@@ -31,6 +37,10 @@ def count_files(folder, exts):
 
     if not folder.exists():
         return 0
+
+    record = read_json(folder / MANIFEST)
+    if record is not None:
+        return sum(Path(n).suffix.lower() in exts for n in record["files"])
 
     count = 0
 
@@ -64,7 +74,8 @@ def run_script(step_name, script_name):
 
     result = subprocess.run(
         [sys.executable, str(script_path)],
-        cwd=str(BASE_DIR)
+        cwd=str(BASE_DIR),
+        env={**os.environ, "UAV_CONFIG": str(config_path)}
     )
 
     end = time.time()
@@ -77,15 +88,53 @@ def run_script(step_name, script_name):
 
 def main():
     print("数据处理流水线启动")
-
+    status_path = Path(OUTPUT_ROOT) / "pipeline_status.json"
+    status = {"started": time.strftime("%Y-%m-%d %H:%M:%S"), "status": "running", "stages": [],
+              "configuration": {"sha256": digest(config_path), "frame_interval": FRAME_INTERVAL,
+                                "similarity_threshold": MIN_SIMILARITY_THRESHOLD}}
+    atomic_json(status_path, status)
     print_status()
-
-    for step_name, script_name in SCRIPTS:
-        run_script(step_name, script_name)
+    for step_name, script_name in SCRIPTS[:-1]:
+        entry = {"stage": script_name, "status": "running"}
+        status["stages"].append(entry)
+        atomic_json(status_path, status)
+        try:
+            if digest(config_path) != status["configuration"]["sha256"]:
+                raise RuntimeError("Configuration changed during this run")
+            run_script(step_name, script_name)
+        except Exception as error:
+            entry.update(status="failed", error=str(error))
+            status["status"] = "failed"
+            atomic_json(status_path, status)
+            # Preserve a failure report even when later processing cannot proceed.
+            run_script(*SCRIPTS[-1])
+            raise
+        entry["status"] = "passed"
+        atomic_json(status_path, status)
         print_status()
+    final_step = {"stage": "verify_outputs_and_report", "status": "running"}
+    status["stages"].append(final_step)
+    atomic_json(status_path, status)
+    try:
+        from generate_report import state_fingerprint
+        status["state_sha256"] = state_fingerprint()
+        rejected = read_json(Path(DEDUP_IMAGE_DIR) / "rejected_images.json", [])
+        status["status"] = "complete_with_exclusions" if rejected else "complete"
+        final_step["status"] = "passed"
+        atomic_json(status_path, status)
+        run_script(*SCRIPTS[-1])
+    except Exception as error:
+        status["status"] = "failed"
+        final_step.update(status="failed", error=str(error))
+        atomic_json(status_path, status)
+        try:
+            run_script(*SCRIPTS[-1])
+        except Exception as report_error:
+            print(f"Failure report could not be regenerated: {report_error}")
+        raise
 
     print("\n" + "=" * 60)
-    print("全部流程完成")
+    print(f"全部流程完成: {status['status']}")
     print("=" * 60)
 
     print_status()

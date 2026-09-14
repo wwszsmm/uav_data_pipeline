@@ -1,285 +1,188 @@
 import csv
-import shutil
+import json
+import os
+import tempfile
+import zipfile
+import zlib
+from importlib.metadata import version
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 import faiss
 import numpy as np
 import torch
-from imagededup.methods.cnn import CNN
 from PIL import Image, UnidentifiedImageError
-from torchvision import transforms
-from tqdm import tqdm
 
-from config import (
-    GATHER_IMAGE_DIR,
-    DEDUP_IMAGE_DIR,
-    FEATURE_FILE,
-    MIN_SIMILARITY_THRESHOLD,
-    BATCH_SIZE,
-    MAX_THREADS,
-    IMAGE_EXTS,
-)
-
+from pipeline_config import (GATHER_IMAGE_DIR, DEDUP_IMAGE_DIR, FEATURE_FILE,
+                             MIN_SIMILARITY_THRESHOLD, BATCH_SIZE, MAX_THREADS, IMAGE_EXTS)
+from pipeline_utils import atomic_json, digest, managed_files, manifest, sync_files
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-preprocess = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-])
-
 
 def find_images(image_dir):
-    image_dir = Path(image_dir)
-
-    if not image_dir.exists():
-        return []
-
-    return sorted([
-        p for p in image_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTS
-    ])
+    return managed_files(image_dir, IMAGE_EXTS)
 
 
-def load_image(img_path):
+def load_image(img_path, preprocess):
     try:
         with Image.open(img_path) as img:
             tensor = preprocess(img.convert("RGB"))
         return img_path.name, tensor
-    except (UnidentifiedImageError, OSError):
+    except (UnidentifiedImageError, OSError, ValueError):
         return None
 
 
-def load_feature_cache(feature_file):
-    feature_file = Path(feature_file)
+def feature_identity(image_files):
+    return {
+        "schema": 2,
+        "images": {p.name: digest(p) for p in image_files},
+        "model": "mobilenet_v3_small/IMAGENET1K_V1",
+        "preprocess": "encoder.transform",
+        "versions": {p: version(p) for p in ("imagededup", "torch", "torchvision", "Pillow")},
+    }
 
-    if not feature_file.exists():
+
+def load_feature_cache(feature_file, identity):
+    try:
+        with np.load(feature_file, allow_pickle=False) as data:
+            if json.loads(str(data["metadata"].item())) != identity:
+                return None
+            names, features = data["names"].tolist(), data["features"]
+            if (not isinstance(names, list) or len(names) != len(features) or features.ndim != 2
+                    or not all(isinstance(n, str) for n in names)
+                    or len(set(names)) != len(names) or not set(names).issubset(identity["images"])
+                    or not np.isfinite(features).all()
+                    or (len(features) and (np.linalg.norm(features, axis=1) == 0).any())):
+                return None
+            return dict(zip(names, features.copy()))
+    except (OSError, ValueError, KeyError, EOFError, TypeError, zipfile.BadZipFile, zlib.error):
         return None
 
-    with np.load(feature_file) as data:
-        return {name: data[name].copy() for name in data.files}
 
-
-def save_feature_cache(feature_file, encodings):
+def save_feature_cache(feature_file, encodings, identity):
     feature_file = Path(feature_file)
     feature_file.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(feature_file, **encodings)
+    fd, temporary = tempfile.mkstemp(dir=feature_file.parent, suffix=".npz")
+    names = sorted(encodings)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            np.savez_compressed(stream, metadata=json.dumps(identity, sort_keys=True),
+                                names=np.asarray(names, dtype=str),
+                                features=np.vstack([encodings[n] for n in names]) if names else np.empty((0, 0)))
+        os.replace(temporary, feature_file)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def build_features(image_files, feature_file):
-    """
-    有缓存就加载；缓存和当前图片名不一致就重建。
-    """
-    current_names = {p.name for p in image_files}
-
-    cached = load_feature_cache(feature_file)
-    if cached is not None and set(cached.keys()) == current_names:
-        print(f"加载已缓存特征，共 {len(cached)} 张图片")
-        return cached
-
+    identity = feature_identity(image_files)
+    cached = load_feature_cache(feature_file, identity)
     if cached is not None:
-        print("特征缓存和当前图片不一致，重新生成特征...")
-
-    print("开始生成图片特征...")
-
+        print(f"Loaded verified feature cache: {len(cached)} images")
+        return cached
+    # Construct only after a cache miss. First construction may download public ImageNet weights.
+    from imagededup.methods.cnn import CNN
     encoder = CNN()
     encoder.model.to(device)
     encoder.model.eval()
-
     encodings = {}
-
-    for start in tqdm(range(0, len(image_files), BATCH_SIZE), desc="Encoding"):
-        batch_files = image_files[start:start + BATCH_SIZE]
-
-        tensors = []
-        names = []
-
-        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-            futures = [executor.submit(load_image, p) for p in batch_files]
-
-            for future in as_completed(futures):
-                result = future.result()
-                if result is None:
-                    continue
-
-                name, tensor = result
-                names.append(name)
-                tensors.append(tensor)
-
-        if not tensors:
-            continue
-
-        batch_tensor = torch.stack(tensors).to(device)
-
-        with torch.no_grad():
-            features = encoder.model(batch_tensor).cpu().numpy()
-
-        for name, feature in zip(names, features):
-            encodings[name] = feature
-
-    save_feature_cache(feature_file, encodings)
-    print(f"特征生成完成，共 {len(encodings)} 张图片")
-    print(f"特征缓存已保存: {feature_file}")
-
+    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        for start in range(0, len(image_files), BATCH_SIZE):
+            results = executor.map(lambda p: load_image(p, encoder.transform),
+                                   image_files[start:start + BATCH_SIZE])
+            results = [r for r in results if r is not None]
+            if not results:
+                continue
+            names, tensors = zip(*results)
+            with torch.inference_mode():
+                features = encoder.model(torch.stack(tensors).to(device)).cpu().numpy()
+            for name, feature in zip(names, features):
+                if not np.isfinite(feature).all() or np.linalg.norm(feature) == 0:
+                    raise RuntimeError(f"Invalid model feature: {name}")
+                encodings[name] = feature
+    if feature_identity(image_files) != identity:
+        raise RuntimeError("Images changed while encoding; retry with stable input")
+    save_feature_cache(feature_file, encodings, identity)
     return encodings
 
 
 def build_index(encodings):
-    names = sorted(encodings.keys())
-
+    names = sorted(encodings)
     features = np.vstack([encodings[name] for name in names]).astype("float32")
-
+    if not np.isfinite(features).all() or (np.linalg.norm(features, axis=1) == 0).any():
+        raise ValueError("Features must be finite and non-zero")
     faiss.normalize_L2(features)
-
     index = faiss.IndexFlatIP(features.shape[1])
     index.add(features)
-
     return index, features, names
 
 
 def find_duplicates(index, features, names, threshold):
-    if len(names) < 2:
-        return [], set()
-
-    k = min(20, len(names))
-
-    scores, indices = index.search(features, k)
-
-    duplicate_pairs = []
-    duplicate_names = set()
-
+    """Greedy representatives in filename order; every match points to a retained image."""
+    pairs, duplicates = [], set()
     for idx, name in enumerate(names):
-        if name in duplicate_names:
+        if name in duplicates:
             continue
-
-        for score, neighbor_idx in zip(scores[idx][1:], indices[idx][1:]):
-            if neighbor_idx < 0:
-                continue
-
-            if score < threshold:
+        # Expand top-k only while the tail may hide further qualifying neighbors.
+        k = min(20, len(names))
+        while k:
+            scores, neighbors = index.search(features[idx:idx + 1], k)
+            if k == len(names) or scores[0][-1] < threshold:
                 break
-
-            duplicate_name = names[neighbor_idx]
-
-            if duplicate_name == name or duplicate_name in duplicate_names:
+            k = min(k * 2, len(names))
+        if not k:
+            continue
+        for score, neighbor in sorted(zip(scores[0], neighbors[0]), key=lambda item: int(item[1])):
+            if neighbor <= idx or score < threshold:
                 continue
-
-            duplicate_pairs.append((
-                name,
-                duplicate_name,
-                round(float(score), 4)
-            ))
-
-            duplicate_names.add(duplicate_name)
-
-    return duplicate_pairs, duplicate_names
+            duplicate = names[neighbor]
+            if duplicate not in duplicates:
+                duplicates.add(duplicate)
+                pairs.append((name, duplicate, round(float(score), 6)))
+    return pairs, duplicates
 
 
 def copy_unique_images(image_files, output_dir, duplicate_names):
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    unique_files = [
-        p for p in image_files
-        if p.name not in duplicate_names
-    ]
-
-    unique_names = {p.name for p in unique_files}
-
-    removed = 0
-    copied = 0
-    skipped = 0
-    failed = 0
-
-    # 删除 dedup_images 里已经不属于当前唯一结果的旧图片
-    for old_file in output_dir.iterdir():
-        if old_file.is_file() and old_file.suffix.lower() in IMAGE_EXTS:
-            if old_file.name not in unique_names:
-                old_file.unlink()
-                removed += 1
-
-    for src_path in tqdm(unique_files, desc="Copy unique"):
-        dst_path = output_dir / src_path.name
-
-        if dst_path.exists():
-            skipped += 1
-            continue
-
-        try:
-            shutil.copy2(src_path, dst_path)
-            copied += 1
-        except Exception as e:
-            failed += 1
-            print(f"复制失败: {src_path} -> {dst_path} | {e}")
-
-    return copied, skipped, removed, failed
+    unique = {p.name: p for p in image_files if p.name not in duplicate_names}
+    previous = manifest(output_dir)
+    removed = len(set(previous["files"]) - set(unique))
+    copied, skipped = sync_files(unique, output_dir)
+    return copied, skipped, removed, 0
 
 
 def save_duplicate_csv(output_dir, duplicate_pairs):
     csv_path = Path(output_dir) / "duplicate_pairs.csv"
-
-    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
+    with csv_path.open("w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.writer(stream)
         writer.writerow(["original", "duplicate", "similarity"])
         writer.writerows(duplicate_pairs)
-
     return csv_path
 
 
 def main():
-    image_dir = Path(GATHER_IMAGE_DIR)
-    output_dir = Path(DEDUP_IMAGE_DIR)
-    feature_file = Path(FEATURE_FILE)
-
-    print("开始相似图片去重")
-    print(f"输入图片文件夹: {image_dir}")
-    print(f"输出图片文件夹: {output_dir}")
-    print(f"特征缓存文件: {feature_file}")
-    print(f"相似度阈值: {MIN_SIMILARITY_THRESHOLD}")
-    print(f"运行设备: {device}")
-
-    image_files = find_images(image_dir)
-
+    image_files = find_images(GATHER_IMAGE_DIR)
     if not image_files:
-        print(f"没有找到图片，请检查输入路径: {image_dir}")
-        return
-
-    print(f"找到 {len(image_files)} 张图片")
-
-    encodings = build_features(image_files, feature_file)
-
+        raise RuntimeError("No current gathered images; run image_gather.py first")
+    manifest(DEDUP_IMAGE_DIR)
+    encodings = build_features(image_files, FEATURE_FILE)
+    rejected = sorted(p.name for p in image_files if p.name not in encodings)
+    atomic_json(Path(DEDUP_IMAGE_DIR) / "rejected_images.json", rejected)
     if not encodings:
-        print("没有成功提取到图片特征，去重终止")
-        return
-
+        sync_files({}, DEDUP_IMAGE_DIR)
+        raise RuntimeError("No readable images could be encoded")
     index, features, names = build_index(encodings)
-
-    duplicate_pairs, duplicate_names = find_duplicates(
-        index=index,
-        features=features,
-        names=names,
-        threshold=MIN_SIMILARITY_THRESHOLD
-    )
-
-    copied, skipped, removed, failed = copy_unique_images(
-        image_files=image_files,
-        output_dir=output_dir,
-        duplicate_names=duplicate_names
-    )
-
-    csv_path = save_duplicate_csv(output_dir, duplicate_pairs)
-
-    print("\n相似图片去重完成")
-    print(f"原始图片数量: {len(image_files)}")
-    print(f"重复图片数量: {len(duplicate_names)}")
-    print(f"唯一图片数量: {len(image_files) - len(duplicate_names)}")
-    print(f"本次新增复制: {copied}")
-    print(f"已存在跳过: {skipped}")
-    print(f"删除旧结果: {removed}")
-    print(f"复制失败: {failed}")
-    print(f"唯一图片输出文件夹: {output_dir}")
-    print(f"重复图片 CSV: {csv_path}")
+    pairs, duplicates = find_duplicates(index, features, names, MIN_SIMILARITY_THRESHOLD)
+    # Unreadable images never enter the cleaned output.
+    valid_files = [p for p in image_files if p.name in encodings]
+    copied, skipped, removed, failed = copy_unique_images(valid_files, DEDUP_IMAGE_DIR, duplicates)
+    save_duplicate_csv(DEDUP_IMAGE_DIR, pairs)
+    stats = {"input": len(image_files), "valid_input": len(encodings), "invalid_input": len(rejected),
+             "duplicates": len(duplicates), "valid_output": len(encodings) - len(duplicates),
+             "copy_failures": failed, "threshold": MIN_SIMILARITY_THRESHOLD}
+    atomic_json(Path(DEDUP_IMAGE_DIR) / "dedup_summary.json", stats)
+    print(f"Deduplication: {stats}; copied/updated={copied}, unchanged={skipped}, removed_owned={removed}")
 
 
 if __name__ == "__main__":

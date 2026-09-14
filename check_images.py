@@ -3,7 +3,8 @@ from pathlib import Path
 
 import cv2
 
-from config import DEDUP_IMAGE_DIR, OUTPUT_ROOT, IMAGE_EXTS
+from pipeline_config import DEDUP_IMAGE_DIR, OUTPUT_ROOT, IMAGE_EXTS
+from pipeline_utils import atomic_json, managed_files
 
 
 def check_images(folder):
@@ -14,7 +15,7 @@ def check_images(folder):
     if not folder.exists():
         raise FileNotFoundError(f"图片目录不存在: {folder}")
 
-    for image_path in folder.rglob("*"):
+    for image_path in managed_files(folder, IMAGE_EXTS):
         if not image_path.is_file():
             continue
 
@@ -28,12 +29,13 @@ def check_images(folder):
                 invalid_images.append((str(image_path), "empty_file"))
                 continue
 
-            image = cv2.imread(str(image_path))
+            import numpy as np
+            image = cv2.imdecode(np.frombuffer(image_path.read_bytes(), dtype=np.uint8), cv2.IMREAD_COLOR)
 
             if image is None or image.size == 0:
                 invalid_images.append((str(image_path), "unreadable_image"))
 
-        except OSError as error:
+        except (OSError, cv2.error) as error:
             invalid_images.append((str(image_path), str(error)))
 
     return total, invalid_images
@@ -51,6 +53,10 @@ def main():
 
     report_path = Path(OUTPUT_ROOT) / "invalid_images.csv"
     save_invalid_images(invalid_images, report_path)
+    atomic_json(Path(OUTPUT_ROOT) / "image_check.json",
+                {"checked": total, "invalid": len(invalid_images), "valid": total - len(invalid_images)})
+    if invalid_images or total == 0:
+        raise RuntimeError(f"Output integrity check failed: total={total}, invalid={len(invalid_images)}")
 
     print("\n图片质量检查完成")
     print(f"检查图片: {total}")
